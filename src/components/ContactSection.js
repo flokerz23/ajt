@@ -7,15 +7,42 @@ const ContactSection = ({ isDarkMode }) => {
     name: '',
     email: '',
     message: '',
-    phone: ''
+    phone: '',
+    website: '' // Honeypot field
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitStatus, setSubmitStatus] = useState(null);
   const [errors, setErrors] = useState({});
   const [gdprConsent, setGdprConsent] = useState(false);
 
+  // Rate limiting configuration (60 seconds cooldown)
+  const RATE_LIMIT_COOLDOWN = 60 * 1000; // 60 seconds in milliseconds
+  const STORAGE_KEY = 'contactFormLastSubmission';
+
+  // Input sanitization function
+  const sanitizeInput = (input) => {
+    if (typeof input !== 'string') return '';
+    
+    // Remove potentially dangerous characters and trim
+    return input
+      .trim()
+      .replace(/[<>]/g, '') // Remove angle brackets
+      .replace(/\0/g, '') // Remove null bytes
+      .replace(/[\x00-\x1F\x7F]/g, ''); // Remove control characters
+  };
+
+  // Sanitize email - more permissive for email format
+  const sanitizeEmail = (email) => {
+    if (typeof email !== 'string') return '';
+    return email.trim().toLowerCase();
+  };
+
   const handleChange = (e) => {
     const { name, value } = e.target;
+    
+    // Don't allow changes to honeypot field through UI
+    if (name === 'website') return;
+    
     setFormData({
       ...formData,
       [name]: value
@@ -30,23 +57,60 @@ const ContactSection = ({ isDarkMode }) => {
     }
   };
 
+  // Check rate limiting
+  const checkRateLimit = () => {
+    const lastSubmission = localStorage.getItem(STORAGE_KEY);
+    if (!lastSubmission) return null;
+    
+    const timeSinceLastSubmission = Date.now() - parseInt(lastSubmission, 10);
+    if (timeSinceLastSubmission < RATE_LIMIT_COOLDOWN) {
+      const secondsRemaining = Math.ceil((RATE_LIMIT_COOLDOWN - timeSinceLastSubmission) / 1000);
+      return secondsRemaining;
+    }
+    
+    return null;
+  };
+
   const validateForm = () => {
     const newErrors = {};
     
+    // Check honeypot field - if filled, it's a bot
+    if (formData.website && formData.website.trim() !== '') {
+      // Silently reject without showing error (bot detected)
+      return { bot: true };
+    }
+    
+    // Check rate limiting
+    const rateLimitError = checkRateLimit();
+    if (rateLimitError) {
+      newErrors.rateLimit = `Te rugăm să aștepți ${rateLimitError} secunde înainte de a trimite din nou.`;
+      return newErrors;
+    }
+    
     if (!formData.name.trim()) {
       newErrors.name = 'Numele este obligatoriu';
+    } else if (formData.name.trim().length > 100) {
+      newErrors.name = 'Numele nu poate depăși 100 de caractere';
     }
     
     if (!formData.email.trim()) {
       newErrors.email = 'Email-ul este obligatoriu';
     } else if (!/\S+@\S+\.\S+/.test(formData.email)) {
       newErrors.email = 'Email-ul nu este valid';
+    } else if (formData.email.length > 254) {
+      newErrors.email = 'Email-ul nu poate depăși 254 de caractere';
+    }
+    
+    if (formData.phone && formData.phone.length > 20) {
+      newErrors.phone = 'Numărul de telefon nu poate depăși 20 de caractere';
     }
     
     if (!formData.message.trim()) {
       newErrors.message = 'Mesajul este obligatoriu';
     } else if (formData.message.trim().length < 10) {
       newErrors.message = 'Mesajul trebuie să aibă cel puțin 10 caractere';
+    } else if (formData.message.trim().length > 2000) {
+      newErrors.message = 'Mesajul nu poate depăși 2000 de caractere';
     }
     
     if (!gdprConsent) {
@@ -61,6 +125,14 @@ const ContactSection = ({ isDarkMode }) => {
     
     // Validate form
     const formErrors = validateForm();
+    
+    // Check if bot was detected (honeypot filled)
+    if (formErrors.bot) {
+      // Silently reject - don't show error to bot, but don't submit
+      setSubmitStatus(null);
+      return;
+    }
+    
     if (Object.keys(formErrors).length > 0) {
       setErrors(formErrors);
       return;
@@ -70,40 +142,60 @@ const ContactSection = ({ isDarkMode }) => {
     setSubmitStatus(null);
     
     try {
+      // Sanitize all inputs before sending
+      const sanitizedData = {
+        name: sanitizeInput(formData.name),
+        email: sanitizeEmail(formData.email),
+        phone: formData.phone ? sanitizeInput(formData.phone) : 'Nu a fost specificat',
+        message: sanitizeInput(formData.message),
+      };
+      
       // EmailJS configuration
       const serviceId = 'service_8tyhlwt';
       const templateId = 'template_iuigl1b'; 
       const publicKey = 'c94WFrwW_FzUwmLQG';
       
       const templateParams = {
-        name: formData.name,
-        email: formData.email,
-        phone: formData.phone || 'Nu a fost specificat',
-        message: formData.message,
+        name: sanitizedData.name,
+        email: sanitizedData.email,
+        phone: sanitizedData.phone,
+        message: sanitizedData.message,
       };
       
-      console.log('Sending email with params:', templateParams);
+      // Only log in development mode
+      if (process.env.NODE_ENV === 'development') {
+        console.log('Sending email with params:', templateParams);
+      }
       
       // Initialize EmailJS with public key
       emailjs.init(publicKey);
       
       const result = await emailjs.send(serviceId, templateId, templateParams);
-      console.log('Email sent successfully:', result);
+      
+      if (process.env.NODE_ENV === 'development') {
+        console.log('Email sent successfully:', result);
+      }
+      
+      // Store submission timestamp for rate limiting
+      localStorage.setItem(STORAGE_KEY, Date.now().toString());
       
       setSubmitStatus('success');
-      setFormData({ name: '', email: '', message: '', phone: '' });
+      setFormData({ name: '', email: '', message: '', phone: '', website: '' });
       setErrors({});
+      setGdprConsent(false);
       
       // Reset status after 5 seconds
       setTimeout(() => setSubmitStatus(null), 5000);
       
     } catch (error) {
-      console.error('EmailJS Error:', error);
-      console.error('Error Text:', error.text);
-      console.error('Error Status:', error.status);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('EmailJS Error:', error);
+        console.error('Error Text:', error.text);
+        console.error('Error Status:', error.status);
+      }
       
-      // Show more specific error message
-      if (error.text) {
+      // Show generic error message in production, specific in development
+      if (process.env.NODE_ENV === 'development' && error.text) {
         alert(`EmailJS Error: ${error.text}`);
       }
       
@@ -171,6 +263,20 @@ const ContactSection = ({ isDarkMode }) => {
             </h3>
             
             <form onSubmit={handleSubmit} className="space-y-6">
+              {/* Honeypot field - hidden from users, visible to bots */}
+              <div style={{ position: 'absolute', left: '-9999px', opacity: 0, pointerEvents: 'none' }} aria-hidden="true">
+                <label htmlFor="website">Website (leave blank)</label>
+                <input
+                  type="text"
+                  id="website"
+                  name="website"
+                  value={formData.website}
+                  onChange={handleChange}
+                  tabIndex="-1"
+                  autoComplete="off"
+                />
+              </div>
+
               <div>
                 <label htmlFor="name" className={`block text-sm font-medium mb-2 ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}>
                   Numele Complet *
@@ -182,6 +288,7 @@ const ContactSection = ({ isDarkMode }) => {
                   value={formData.name}
                   onChange={handleChange}
                   required
+                  maxLength={100}
                   className={`w-full px-4 py-3 rounded-lg border transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                     errors.name 
                       ? 'border-red-500 focus:ring-red-500' 
@@ -207,6 +314,7 @@ const ContactSection = ({ isDarkMode }) => {
                   value={formData.email}
                   onChange={handleChange}
                   required
+                  maxLength={254}
                   className={`w-full px-4 py-3 rounded-lg border transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-primary-500 ${
                     errors.email 
                       ? 'border-red-500 focus:ring-red-500' 
@@ -231,13 +339,19 @@ const ContactSection = ({ isDarkMode }) => {
                   name="phone"
                   value={formData.phone}
                   onChange={handleChange}
+                  maxLength={20}
                   className={`w-full px-4 py-3 rounded-lg border transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-primary-500 ${
-                    isDarkMode 
-                      ? 'bg-gray-600 border-gray-500 text-white placeholder-gray-400' 
-                      : 'bg-white border-gray-300 text-gray-900 placeholder-gray-500'
+                    errors.phone
+                      ? 'border-red-500 focus:ring-red-500'
+                      : isDarkMode 
+                        ? 'bg-gray-600 border-gray-500 text-white placeholder-gray-400' 
+                        : 'bg-white border-gray-300 text-gray-900 placeholder-gray-500'
                   }`}
                   placeholder="+40 123 456 789"
                 />
+                {errors.phone && (
+                  <p className="mt-1 text-sm text-red-500">{errors.phone}</p>
+                )}
               </div>
 
               <div>
@@ -251,6 +365,8 @@ const ContactSection = ({ isDarkMode }) => {
                   onChange={handleChange}
                   required
                   rows={6}
+
+                  maxLength={2000}
                   className={`w-full px-4 py-3 rounded-lg border transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-primary-500 resize-none ${
                     errors.message 
                       ? 'border-red-500 focus:ring-red-500' 
@@ -298,6 +414,9 @@ const ContactSection = ({ isDarkMode }) => {
               </div>
               {errors.gdpr && (
                 <p className="text-sm text-red-500">{errors.gdpr}</p>
+              )}
+              {errors.rateLimit && (
+                <p className="text-sm text-red-500">{errors.rateLimit}</p>
               )}
 
               {/* Advertising Disclaimer */}
